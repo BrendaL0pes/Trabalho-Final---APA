@@ -90,9 +90,56 @@ Cada instância recebe um orçamento de tempo proporcional ao número de pedidos
 
 ---
 
-## 4. Resultados: função objetivo por instância vs. melhor conhecida
+## 4. Como executar, testar e demonstrar
 
-Todas as 50 instâncias oficiais (`datasets/a`, `datasets/b`, `datasets/x`) foram resolvidas e **100% das soluções passaram no `checker.py` oficial como viáveis** (nenhuma instância zerada por infactibilidade). A tabela completa está em `results_table.csv` / `table.md`; resumo por dataset:
+Python 3, com `numpy`, `scipy` e `ortools`. O `checker.py` usa só `numpy`. O caminho exato precisa do OR-Tools. Na pasta do projeto:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install numpy scipy ortools
+```
+
+### Demonstração
+
+A instância `datasets/a/instance_0020.txt` é o exemplo do enunciado: 5 pedidos, 5 itens, 5 corredores, limites 5 e 12. O ótimo vale 5.
+
+```bash
+.venv/bin/python solve_one.py datasets/a/instance_0020.txt /tmp/sol_0020.txt --budget 30
+.venv/bin/python checker.py datasets/a/instance_0020.txt /tmp/sol_0020.txt
+```
+
+O solver imprime `method=exact`, `ratio=5.000000`, 4 pedidos e 2 corredores, em menos de um segundo. O checker imprime `Is solution feasible: True` e `Objective function value: 5.0`. O arquivo gerado traz, um número por linha, a quantidade de pedidos, os índices 0, 1, 2 e 4, a quantidade de corredores e os índices 1 e 3.
+
+`--method exact` ou `--method heuristic` força o caminho. Sem a opção, `O ≤ 200` usa o exato. `--budget` é o tempo em segundos. `--seed` controla a parte aleatória da heurística.
+
+### Teste de uma solução já gravada
+
+O checker também lê as saídas entregues, sem resolver de novo:
+
+```bash
+.venv/bin/python checker.py datasets/a/instance_0020.txt output/a/instance_0020.txt
+```
+
+O mesmo vale para qualquer par `datasets/<dataset>/instance_XXXX.txt` e `output/<dataset>/instance_XXXX.txt`.
+
+### Lote e revalidação das 50
+
+`run_all.py` regrava `output/<dataset>/`. O orçamento vai de 30 s, quando `O ≤ 200`, até 80 s nas maiores. O log `run_log.tsv` fica fora do Git.
+
+```bash
+.venv/bin/python run_all.py a --start 1 --end 20
+.venv/bin/python run_all.py b --start 1 --end 15
+.venv/bin/python run_all.py x --start 1 --end 15
+.venv/bin/python build_report_table.py
+```
+
+`build_report_table.py` passa as 50 soluções de `output/` no checker e reescreve `results_table.csv`.
+
+---
+
+## 5. Resultados: função objetivo por instância vs. melhor conhecida
+
+Todas as 50 instâncias oficiais (`datasets/a`, `datasets/b`, `datasets/x`) foram resolvidas e **100% das soluções passaram no `checker.py` oficial como viáveis** (nenhuma instância zerada por infactibilidade). A tabela completa está em `results_table.csv`; resumo por dataset:
 
 | Dataset | Nº instâncias | Gap médio | Gap máximo | Nº ótimos (gap = 0) |
 |---|---:|---:|---:|---:|
@@ -107,7 +154,7 @@ Para contexto adicional, `results/final_phase.pdf` (resultados oficiais da fase 
 
 ---
 
-## 5. Limitações da solução atual
+## 6. Limitações da solução atual
 
 1. **Construção gulosa por amostragem**: a escolha do "melhor pedido marginal" a cada expansão é feita sobre uma amostra aleatória (até 800 candidatos) e não sobre o conjunto completo de pedidos restantes, por razão de desempenho. Isso pode deixar passar combinações de pedidos/corredores melhores, especialmente em instâncias com muitos milhares de pedidos.
 2. **O passo de "set cover" (`dry_run_new_aisles`) é guloso e local** — não garante o número mínimo de corredores novos para cobrir o déficit de um pedido; é NP‑difícil em geral e aqui é apenas aproximado.
@@ -116,7 +163,7 @@ Para contexto adicional, `results/final_phase.pdf` (resultados oficiais da fase 
 5. **Sem portfólio de métodos**: não há comparação interna entre, por exemplo, Simulated Annealing com *annealing schedule* explícito ou um PLI com *cutting planes* dedicados (desigualdades válidas de cobertura) — poderia melhorar a qualidade do MILP exato e estender o limiar de 200 pedidos.
 6. **O limiar `O ≤ 200` para o método exato é fixo e arbitrário** — não há um critério adaptativo (ex.: baseado em `O × A` ou na densidade da matriz) que decida dinamicamente quando vale a pena tentar o MILP exato.
 
-## 6. O que seria melhorado com mais tempo
+## 7. O que seria melhorado com mais tempo
 
 - Usar o orçamento completo de 600 s por instância (dentro do limite oficial), e paralelizar execuções independentes entre instâncias.
 - Resolver a relaxação linear do MILP a cada iteração de Dinkelbach para obter um **limite superior (upper bound)** e assim reportar um gap de otimalidade certificado (não apenas o gap contra o melhor conhecido pela competição).

@@ -34,7 +34,13 @@ python3 -m venv .venv
 
 `--method exact` ou `--method heuristic` força o caminho. Sem a opção, `O ≤ 200` usa o exato e o resto usa a heurística. `--seed` controla a parte aleatória da heurística. `--budget` é o tempo em segundos.
 
-O arquivo de saída tem quatro linhas: quantidade de pedidos, índices dos pedidos, quantidade de corredores, índices dos corredores. Índices começam em 0.
+O solver imprime `method=exact`, `ratio=5.000000`, 4 pedidos e 2 corredores. O checker imprime `Is solution feasible: True` e `Objective function value: 5.0`. O arquivo traz um número por linha: a quantidade de pedidos, os índices 0, 1, 2 e 4, a quantidade de corredores e os índices 1 e 3.
+
+Para conferir uma solução já gravada, sem resolver de novo:
+
+```bash
+.venv/bin/python checker.py datasets/a/instance_0020.txt output/a/instance_0020.txt
+```
 
 ## Lote e tabela
 
