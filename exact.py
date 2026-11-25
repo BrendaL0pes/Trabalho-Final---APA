@@ -53,7 +53,7 @@ def solve_inner_milp(inst, q, time_limit_s, hint=None):
         return None
     sel_o = {o for o in range(inst.O) if x[o].solution_value() > 0.5}
     sel_a = {a for a in range(inst.A) if y[a].solution_value() > 0.5}
-    return sel_o, sel_a
+    return sel_o, sel_a, status == pywraplp.Solver.OPTIMAL
 
 
 def solve_exact(inst, time_budget, iter_time=None, max_iters=20):
@@ -70,7 +70,7 @@ def solve_exact(inst, time_budget, iter_time=None, max_iters=20):
         res = solve_inner_milp(inst, q, tl, hint=hint)
         if res is None:
             break
-        sel_o, sel_a = res
+        sel_o, sel_a, optimal = res
         hint = (sel_o, sel_a)
         units = sum(int(inst.order_units[o]) for o in sel_o)
         if not sel_a or units < inst.wave_lb or units > inst.wave_ub:
@@ -78,8 +78,10 @@ def solve_exact(inst, time_budget, iter_time=None, max_iters=20):
         ratio = units / len(sel_a)
         if ratio > best[0]:
             best = (ratio, sel_o, sel_a)
-        new_q = ratio
-        if abs(new_q - q) < 1e-7:
+        # A timed-out inner solve is feasible, but it is not a valid Dinkelbach step.
+        if not optimal:
             break
-        q = new_q
+        if abs(ratio - q) < 1e-7:
+            break
+        q = ratio
     return sorted(best[1]), sorted(best[2]), best[0]

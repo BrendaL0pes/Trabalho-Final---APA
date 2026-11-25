@@ -230,32 +230,32 @@ class State:
                     changed = True
 
     def try_remove_order_if_frees_aisle(self, o, q):
-        """Remove order o if doing so lets us drop >=1 aisle with net ratio-surrogate gain."""
+        """Remove order o if doing so lets us drop >=1 aisle with net ratio-surrogate gain.
+
+        Aisles are dropped one at a time on a copy of the state. Two aisles that
+        each cover the same item look redundant individually, and removing both
+        at once would leave the remaining orders uncovered.
+        """
         if o not in self.sel_orders:
             return False
         units = int(self.inst.order_units[o])
         if self.total_units - units < self.inst.wave_lb:
             return False
-        idx, val = self.inst.order_items[o]
-        trial_demand = self.demand.copy()
-        trial_demand[idx] -= val
-        freed = []
-        for a_idx in list(self.sel_aisles):
-            a_idx_items, a_val = self.inst.aisle_items[a_idx]
-            new_supply = self.supply[a_idx_items] - a_val
-            # would remaining aisles (minus this one) still cover trial_demand?
-            if np.all(new_supply >= trial_demand[a_idx_items]):
-                freed.append(a_idx)
-        if len(freed) == 0:
+        trial = self.clone()
+        trial.remove_order_raw(o)
+        n_before = len(trial.sel_aisles)
+        trial.remove_redundant_aisles()
+        n_freed = n_before - len(trial.sel_aisles)
+        if n_freed <= 0 or not trial.sel_aisles:
             return False
-        gain = q * len(freed) - units
-        if gain > 1e-9:
-            self.remove_order_raw(o)
-            for a_idx in freed:
-                self.remove_aisle_raw(a_idx)
-            self.remove_redundant_aisles()
-            return True
-        return False
+        if q * n_freed - units <= 1e-9:
+            return False
+        self.demand = trial.demand
+        self.supply = trial.supply
+        self.sel_orders = trial.sel_orders
+        self.sel_aisles = trial.sel_aisles
+        self.total_units = trial.total_units
+        return True
 
 
 def construct2(inst, q, rng, deadline, sample_size=800):
@@ -353,23 +353,22 @@ def trim_pass(state, inst, q):
 
 
 def local_search(state, inst, q, rng, deadline, max_fails=400):
+    """One pass of add-or-remove moves. The coin flip chooses the move:
+    add an order that is out of the wave, or drop one that is in it.
+    """
     order_list = list(range(inst.O))
     fails = 0
     while time.time() < deadline and fails < max_fails:
-        move = rng.random()
         improved = False
-        if move < 0.5:
-            o = rng.choice(order_list)
-            if o not in state.sel_orders:
-                improved = state.try_add_order(o, q)
-            else:
-                improved = state.try_remove_order_if_frees_aisle(o, q)
-        else:
-            o = rng.choice(order_list)
-            if o in state.sel_orders:
-                improved = state.try_remove_order_if_frees_aisle(o, q)
-            else:
-                improved = state.try_add_order(o, q)
+        if rng.random() < 0.5:
+            for _ in range(20):
+                o = rng.choice(order_list)
+                if o not in state.sel_orders:
+                    improved = state.try_add_order(o, q)
+                    break
+        elif state.sel_orders:
+            o = rng.choice(tuple(state.sel_orders))
+            improved = state.try_remove_order_if_frees_aisle(o, q)
         if improved:
             fails = 0
         else:
@@ -406,14 +405,309 @@ def ensure_lb(inst, state, rng, deadline):
     return state
 
 
+def _aisle_pool(inst, k):
+    """Aisles worth trying: those that fully cover many units alone, interleaved
+    with those that hold a lot of stock that the backlog actually demands."""
+    full = np.zeros(inst.A, dtype=np.float64)
+    for o in range(inst.O):
+        idx, val = inst.order_items[o]
+        possible = None
+        for it, v in zip(idx.tolist(), val.tolist()):
+            cands = [a for a, qty in inst.item_to_aisles[it] if qty >= int(v)]
+            if not cands:
+                possible = set()
+                break
+            got = set(cands)
+            possible = got if possible is None else possible & got
+            if not possible:
+                break
+        if not possible:
+            continue
+        u = float(inst.order_units[o])
+        for a in possible:
+            full[a] += u
+    np.minimum(full, inst.wave_ub, out=full)
+
+    total_demand = np.asarray(inst.order_mat.sum(axis=0)).ravel()
+    useful = np.zeros(inst.A, dtype=np.float64)
+    for a, (idx, val) in enumerate(inst.aisle_items):
+        if len(idx) == 0:
+            continue
+        useful[a] = float(np.minimum(val, total_demand[idx]).sum())
+
+    by_full = np.argsort(-full)
+    by_useful = np.argsort(-useful)
+    pool = []
+    seen = set()
+    for i in range(inst.A):
+        for src, score in ((by_full, full), (by_useful, useful)):
+            a = int(src[i])
+            if a in seen or score[a] <= 0:
+                continue
+            seen.add(a)
+            pool.append(a)
+            if len(pool) >= k:
+                return pool
+    return pool
+
+
+def _subset_closest_to_cap(feas, units, cap):
+    """0-1 subset of `feas` whose unit sum is as large as possible without passing `cap`.
+    Returns the chosen order ids, or None when an exact subset-sum is too large."""
+    n = len(feas)
+    cap = int(cap)
+    if n == 0 or cap <= 0:
+        return []
+    if n * cap > 8_000_000:
+        return None
+    reachable = np.zeros(cap + 1, dtype=bool)
+    reachable[0] = True
+    prev_i = np.full(cap + 1, -1, dtype=np.int32)
+    prev_s = np.full(cap + 1, -1, dtype=np.int32)
+    for i, u in enumerate(units.tolist()):
+        u = int(u)
+        if u <= 0 or u > cap:
+            continue
+        src = np.flatnonzero(reachable[: cap + 1 - u])
+        dest = src + u
+        mask = ~reachable[dest]
+        if not mask.any():
+            continue
+        src = src[mask]
+        dest = dest[mask]
+        reachable[dest] = True
+        prev_i[dest] = i
+        prev_s[dest] = src
+    best_s = int(np.max(np.flatnonzero(reachable)))
+    chosen = []
+    s = best_s
+    while s > 0 and prev_i[s] >= 0:
+        i = int(prev_i[s])
+        chosen.append(int(feas[i]))
+        s = int(prev_s[s])
+    return chosen
+
+
+def pack_aisles(inst, aisles):
+    """Fill a fixed aisle set. With |Y| fixed, the ratio is maximized by taking
+    as many units as possible inside [LB, UB] without exceeding supply.
+    Returns a feasible State, or None."""
+    base = State(inst)
+    for a in aisles:
+        base.add_aisle_raw(int(a))
+    if not base.sel_aisles:
+        return None
+    idx = np.arange(inst.O, dtype=np.int64)
+    feas = idx[base.free_fit_mask(idx)]
+    if feas.size == 0:
+        return None
+
+    total_dem = np.asarray(inst.order_mat[feas].sum(axis=0)).ravel()
+    total_units = int(inst.order_units[feas].sum())
+    no_conflict = bool(np.all(total_dem <= base.supply))
+
+    def finish(chosen):
+        st = base.clone()
+        for o in chosen:
+            u = int(inst.order_units[o])
+            if st.total_units + u > inst.wave_ub:
+                continue
+            st.add_order_raw(int(o))
+        st.remove_redundant_aisles()
+        if not st.sel_aisles or st.total_units > inst.wave_ub:
+            return None
+        return st
+
+    if no_conflict and total_units <= inst.wave_ub:
+        return finish(feas.tolist())
+
+    candidates = []
+    if no_conflict and total_units > inst.wave_ub:
+        picked = _subset_closest_to_cap(feas, inst.order_units[feas], inst.wave_ub)
+        if picked is not None:
+            candidates.append(picked)
+
+    units = inst.order_units[feas]
+    for sign in (-1.0, 1.0):
+        order = feas[np.argsort(sign * units)]
+        chosen = []
+        dem = np.zeros(inst.I, dtype=np.int64)
+        got = 0
+        for o in order.tolist():
+            u = int(inst.order_units[o])
+            if got + u > inst.wave_ub:
+                continue
+            iix, val = inst.order_items[o]
+            if np.all(base.supply[iix] - dem[iix] >= val):
+                dem[iix] += val
+                got += u
+                chosen.append(int(o))
+        candidates.append(chosen)
+
+    best = None
+    best_key = None
+    for chosen in candidates:
+        st = finish(chosen)
+        if st is None:
+            continue
+        feasible = inst.wave_lb <= st.total_units <= inst.wave_ub
+        # A wave inside the bounds beats any partial fill. Among feasible
+        # waves the ratio decides; below LB, more units is closer to a wave.
+        key = (feasible, st.total_units / len(st.sel_aisles) if feasible else st.total_units)
+        if best_key is None or key > best_key:
+            best_key = key
+            best = st
+    return best
+
+
+def solve_aisle_search(inst, time_budget, seed=0):
+    """Search small aisle sets, then pack each one. Best-known solutions visit
+    only a handful of aisles, so the ratio moves much more with Y than with
+    the order in which orders are appended."""
+    if time_budget <= 0:
+        return [], [], 0.0
+    deadline = time.time() + time_budget
+    if inst.O > 20000:
+        pool_n, parents_n, width, max_size = 12, 8, 2, 4
+    elif inst.O > 8000:
+        pool_n, parents_n, width, max_size = 16, 10, 3, 6
+    else:
+        pool_n, parents_n, width, max_size = 20, 12, 4, 15
+
+    wide_n = 40 if inst.O > 8000 else 80
+    wide = _aisle_pool(inst, max(pool_n, wide_n))
+    pool = wide[:pool_n]
+    best_state = None
+    best_ratio = -1.0
+    cache = {}
+
+    def evaluate(aisle_list):
+        """Pack this aisle set. Returns (beam_score, state). Feasible waves
+        always outrank partial fills in the beam."""
+        nonlocal best_state, best_ratio
+        key = tuple(sorted(int(a) for a in aisle_list))
+        if key in cache:
+            return cache[key]
+        if time.time() >= deadline:
+            return None
+        st = pack_aisles(inst, key)
+        if st is None or not st.sel_aisles:
+            cache[key] = (0.0, None)
+            return cache[key]
+        feasible = inst.wave_lb <= st.total_units <= inst.wave_ub
+        if feasible:
+            ratio = st.total_units / len(st.sel_aisles)
+            score = ratio
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_state = st
+        else:
+            score = -1e18 + st.total_units
+        cache[key] = (score, st)
+        return cache[key]
+
+    # A single aisle is often below LB. Grow those sets anyway.
+    ranked = []
+    for a in pool[:parents_n]:
+        if time.time() >= deadline:
+            break
+        got = evaluate((a,))
+        if got is None:
+            continue
+        ranked.append((got[0], (a,)))
+    beam = sorted(ranked, key=lambda t: -t[0])
+
+    for _size in range(2, max_size + 1):
+        if time.time() >= deadline or not beam:
+            break
+        nxt = []
+        seen = set()
+        expand = beam if _size == 2 else beam[:width]
+        for _score, aisles in expand:
+            have = set(aisles)
+            for a in pool:
+                if time.time() >= deadline:
+                    break
+                if a in have:
+                    continue
+                key = tuple(sorted(have | {a}))
+                if key in seen:
+                    continue
+                seen.add(key)
+                got = evaluate(key)
+                if got is None:
+                    continue
+                nxt.append((got[0], key))
+        if not nxt:
+            break
+        nxt.sort(key=lambda t: -t[0])
+        keep = parents_n if _size == 2 else width
+        beam = nxt[:keep]
+
+    # Prefixes of the ranked pool catch waves that need more aisles than the
+    # beam reaches. Deleting and swapping then drops aisles that dilute the ratio.
+    for k in range(1, min(len(wide), 30) + 1):
+        if time.time() >= deadline:
+            break
+        evaluate(wide[:k])
+
+    passes = 0
+    while best_state is not None and time.time() < deadline and passes < 8:
+        passes += 1
+        before = best_ratio
+        base = list(best_state.sel_aisles)
+        improved = False
+        for a in base:
+            if time.time() >= deadline:
+                break
+            trial = [x for x in base if x != a]
+            if not trial:
+                continue
+            got = evaluate(trial)
+            if got is not None and got[0] > before + 1e-6:
+                improved = True
+                break
+        if improved:
+            continue
+        have = set(best_state.sel_aisles)
+        outside = [a for a in wide if a not in have]
+        for out in list(best_state.sel_aisles):
+            if improved or time.time() >= deadline:
+                break
+            for inn in outside:
+                if time.time() >= deadline:
+                    break
+                trial = [x for x in best_state.sel_aisles if x != out] + [inn]
+                got = evaluate(trial)
+                if got is not None and got[0] > before + 1e-6:
+                    improved = True
+                    break
+        if not improved:
+            break
+
+    if best_state is None:
+        return [], [], 0.0
+    return sorted(best_state.sel_orders), sorted(best_state.sel_aisles), best_ratio
+
+
 def solve_heuristic(inst, time_budget, seed=0):
     rng = random.Random(seed)
     deadline0 = time.time() + time_budget
     best_state = None
     best_ratio = -1.0
 
-    # initial q guess: quick greedy with q=0 (ignore aisle cost) to estimate scale
-    q = 0.0
+    aisle_cut = time.time() + time_budget * 0.5
+    orders, aisles, ratio = solve_aisle_search(inst, max(0.0, aisle_cut - time.time()), seed=seed)
+    if aisles and ratio > best_ratio:
+        best_ratio = ratio
+        best_state = State(inst)
+        for a in aisles:
+            best_state.add_aisle_raw(a)
+        for o in orders:
+            best_state.add_order_raw(o)
+
+    # initial q guess: aisle-set ratio when we have one, otherwise ignore aisle cost
+    q = best_ratio if best_ratio > 0 else 0.0
     iteration = 0
     cur_state = None
     while time.time() < deadline0:
