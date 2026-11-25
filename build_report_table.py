@@ -7,7 +7,7 @@ from wop import Instance  # noqa: E402
 import importlib.util
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
+ROOT = HERE
 
 spec = importlib.util.spec_from_file_location("checker", os.path.join(ROOT, "checker.py"))
 checker_mod = importlib.util.module_from_spec(spec)

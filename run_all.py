@@ -1,7 +1,6 @@
 """Driver: run solve_one.py over a dataset (or a slice of it), with a
 per-instance time budget derived from instance size, writing solutions to
-solution/output/<dataset>/instance_XXXX.txt and appending a log line to
-solution/run_log.tsv.
+output/<dataset>/instance_XXXX.txt and appending a log line to run_log.tsv.
 """
 import argparse
 import os
@@ -10,7 +9,7 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
+ROOT = HERE
 
 
 def budget_for(num_orders):
